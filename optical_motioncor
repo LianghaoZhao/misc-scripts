@@ -380,7 +380,7 @@ def process_image_sequence(input_path, output_dir, channel_selection='all',
         )
     
     # 保存校正后的数据
-    corrected_tiff_path = output_path.with_name(output_path.stem + "_corrected.ome.tif")
+    corrected_tiff_path = output_path.with_name(output_path.stem + ".ome.tif")
     
     # 如果只保存选定的通道
     if len(channels_to_save) < corrected_frames.shape[1]:

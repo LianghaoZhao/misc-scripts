@@ -323,11 +323,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-(base) [zhaolh_@tomato 20250910]$ cat fit.py | grep mask
-        baseline_mask = df['frame'] <= args.baseline # <--- 修改：包含 baseline 帧
-        if baseline_mask.any():
-            baseline_value = df.loc[baseline_mask, 'pearson_above'].mean()
-        fit_mask = df['frame'] > args.baseline # <--- 修改：从 baseline 帧的下一帧开始拟合
-        if not fit_mask.any():
-        t_data_fit = df.loc[fit_mask, 'time_seconds']
-        y_data_fit = df.loc[fit_mask, 'pearson_above'] # <--- 修改：使用原始 pearson_above

@@ -12,6 +12,8 @@ from pathlib import Path
 import argparse
 import glob
 from natsort import natsorted
+import re
+from tqdm import tqdm
 
 def first_order_reaction(t, A0, k, A_inf=0):
     """
@@ -24,6 +26,33 @@ def first_order_reaction(t, A0, k, A_inf=0):
     - t: 时间
     """
     return A_inf + (A0 - A_inf) * np.exp(-k * t)
+
+class ImageReader:
+    """图像读取器类，支持多种格式"""
+    
+    @staticmethod
+    def read_image(file_path: str) -> np.ndarray:
+        """
+        读取图像文件，支持ND2和TIF格式
+        
+        Parameters:
+        - file_path: 图像文件路径
+        
+        Returns:
+        - numpy数组格式的图像数据
+        """
+        file_path = str(file_path)
+        file_ext = Path(file_path).suffix.lower()
+        
+        if file_ext == '.nd2':
+            with nd2.ND2File(file_path) as nd2_file:
+                img_array = nd2_file.asarray()
+        elif file_ext in ['.tif', '.tiff', '.png', '.jpg', '.jpeg']:
+            img_array = io.imread(file_path)
+        else:
+            raise ValueError(f"Unsupported file format: {file_ext}")
+        
+        return img_array
 
 @dataclass
 class CellData:
@@ -338,7 +367,7 @@ class TimeSeriesAnalysis:
             ax5 = axes[2, 0]
             # 获取该细胞的第一个时间点的数据（或任意时间点）
             first_time_data = next((cd for cd in self.all_cells if cd.cell_id == cell_id and cd.time_point >= self.skip_initial_frames), None)
-            if first_time_
+            if first_time_data:
                 # 移除NaN值进行绘图
                 mask = ~(np.isnan(first_time_data.intensity1) | np.isnan(first_time_data.intensity2))
                 ch1_clean = first_time_data.intensity1[mask]
@@ -385,124 +414,67 @@ class FileMatcher:
         计算两个文件名的相似度
         返回0-1之间的分数，1表示完全匹配
         """
-        # 移除常见的后缀
-        nd2_clean = nd2_stem.replace(' -1', '').replace(' -2', '').replace(' -3', '').replace(' -4', '')
-        mask_clean = mask_stem.replace(' -1', '').replace(' -2', '').replace(' -3', '').replace(' -4', '')
+        # 清理文件名，移除常见后缀和标识
+        def clean_filename(name):
+            # 移除常见的蒙版标识
+            name = re.sub(r'_mask.*$', '', name, flags=re.IGNORECASE)
+            name = re.sub(r'_seg.*$', '', name, flags=re.IGNORECASE)
+            name = re.sub(r'_segmentation.*$', '', name, flags=re.IGNORECASE)
+            name = re.sub(r'_channel.*$', '', name, flags=re.IGNORECASE)
+            name = re.sub(r'_cp_masks.*$', '', name, flags=re.IGNORECASE)
+            name = name.lower()
+            return name
         
-        # 移除常见的蒙版标识
-        mask_clean = mask_clean.replace('_mask', '').replace('_seg', '').replace('_segmentation', '')
-        mask_clean = mask_clean.replace('_channel_1_frame_0_cp_masks', '').replace('_cp_masks', '')
+        nd2_clean = clean_filename(nd2_stem)
+        mask_clean = clean_filename(mask_stem)
         
-        # 如果完全匹配（考虑数字后缀）
-        if nd2_stem == mask_stem or nd2_clean == mask_clean:
+        # 完全匹配
+        if nd2_clean == mask_clean:
             return 1.0
         
-        # 如果ND2文件名是蒙版文件名的前缀
-        if mask_stem.startswith(nd2_stem):
-            return 0.9
+        # 计算编辑距离相似度
+        def levenshtein_similarity(s1, s2):
+            if len(s1) == 0 or len(s2) == 0:
+                return 0.0
+            # 使用编辑距离计算相似度
+            import difflib
+            return difflib.SequenceMatcher(None, s1, s2).ratio()
         
-        # 如果清理后的名字匹配
-        if nd2_clean == mask_clean:
-            return 0.8
+
         
-        # 计算最长公共子串的长度作为相似度
-        common_length = len(os.path.commonprefix([nd2_clean.lower(), mask_clean.lower()]))
-        max_length = max(len(nd2_clean), len(mask_clean))
-        
-        if max_length == 0:
-            return 0.0
-        
-        similarity = common_length / max_length
-        
-        # 如果有很高的相似度，返回这个值，否则返回较低的值
-        if similarity > 0.7:
-            return similarity
-        else:
-            return 0.0
+        return levenshtein_similarity(nd2_clean, mask_clean)
     
     @staticmethod
-    def find_matching_mask(nd2_file_path: str, mask_pattern: Optional[str] = None) -> Optional[str]:
+    def match_image_with_masks(image_files: List[str], mask_pattern: Optional[str] = None) -> Dict[str, Optional[str]]:
         """
-        根据ND2文件路径找到匹配的蒙版文件
-        
-        Parameters:
-        - nd2_file_path: ND2文件路径
-        - mask_pattern: 蒙版文件的通配符模式
+        为所有图像文件匹配蒙版
         
         Returns:
-        - 匹配的蒙版文件路径，如果未找到则返回None
-        """
-        nd2_path = Path(nd2_file_path)
-        nd2_stem = nd2_path.stem  # 完整文件名（不含扩展名）
-        nd2_parent = nd2_path.parent
-        
-        # 如果提供了mask_pattern，使用glob模式查找所有蒙版
-        if mask_pattern:
-            mask_files = glob.glob(str(nd2_parent / mask_pattern))
-            mask_files = [f for f in mask_files if Path(f).suffix.lower() != '.nd2']
-        else:
-            # 收集目录中所有可能的蒙版文件
-            mask_extensions = ['.npy', '.tif', '.tiff', '.png', '.jpg', '.jpeg']
-            mask_files = []
-            for ext in mask_extensions:
-                mask_files.extend(glob.glob(str(nd2_parent / f"*{ext}")))
-            # 过滤掉ND2文件
-            mask_files = [f for f in mask_files if Path(f).suffix.lower() != '.nd2']
-        
-        # 为当前ND2文件寻找最佳匹配的蒙版
-        best_match = None
-        best_score = -1
-        
-        for mask_file in mask_files:
-            mask_path = Path(mask_file)
-            mask_stem = mask_path.stem
-            
-            # 计算匹配分数
-            score = FileMatcher.calculate_filename_similarity(nd2_stem, mask_stem)
-            
-            if score > best_score:
-                best_score = score
-                best_match = mask_file
-        
-        # 只有当匹配分数足够高时才返回匹配结果
-        if best_score >= 0.5:  # 设置一个阈值
-            return best_match
-        else:
-            return None
-    
-    @staticmethod
-    def match_nd2_with_masks(nd2_files: List[str], mask_pattern: Optional[str] = None) -> Dict[str, Optional[str]]:
-        """
-        为所有ND2文件匹配蒙版
-        
-        Returns:
-        - 字典，键为ND2文件路径，值为对应的蒙版路径（或None）
+        - 字典，键为图像文件路径，值为对应的蒙版路径（或None）
         """
         matches = {}
         
         # 收集所有蒙版文件
         if mask_pattern:
             # 如果提供了特定的mask_pattern，只使用该模式匹配的蒙版
-            parent_dir = Path(nd2_files[0]).parent if nd2_files else Path('.')
-            all_mask_files = glob.glob(str(parent_dir / mask_pattern))
-            all_mask_files = [f for f in all_mask_files if Path(f).suffix.lower() != '.nd2']
+            all_mask_files = list(glob.glob(mask_pattern))
         else:
             # 否则收集所有可能的蒙版文件
-            parent_dir = Path(nd2_files[0]).parent if nd2_files else Path('.')
+            parent_dir = Path(image_files[0]).parent if image_files else Path('.')
             mask_extensions = ['.npy', '.tif', '.tiff', '.png', '.jpg', '.jpeg']
             all_mask_files = []
             for ext in mask_extensions:
                 all_mask_files.extend(glob.glob(str(parent_dir / f"*{ext}")))
-            all_mask_files = [f for f in all_mask_files if Path(f).suffix.lower() != '.nd2']
+            all_mask_files = [f for f in all_mask_files]
         
         print(f"Found {len(all_mask_files)} potential mask files:")
         for mask_file in all_mask_files:
-            print(f"  {mask_file}")
+            print(f"  {Path(mask_file).name}")
         
-        # 为每个ND2文件找到最佳匹配的蒙版
-        for nd2_file in nd2_files:
-            nd2_path = Path(nd2_file)
-            nd2_stem = nd2_path.stem
+        # 为每个图像文件找到最佳匹配的蒙版
+        for image_file in image_files:
+            image_path = Path(image_file)
+            image_stem = image_path.stem
             
             best_match = None
             best_score = -1
@@ -511,19 +483,14 @@ class FileMatcher:
                 mask_path = Path(mask_file)
                 mask_stem = mask_path.stem
                 
-                score = FileMatcher.calculate_filename_similarity(nd2_stem, mask_stem)
-                
+                score = FileMatcher.calculate_filename_similarity(image_stem, mask_stem)
                 if score > best_score:
                     best_score = score
                     best_match = mask_file
             
-            # 只有当匹配分数足够高时才认为匹配成功
-            if best_score >= 0.5:
-                matches[nd2_file] = best_match
-                print(f"Matched {nd2_file} with {best_match} (score: {best_score:.2f})")
-            else:
-                matches[nd2_file] = None
-                print(f"No good match found for {nd2_file} (best score: {best_score:.2f})")
+            # 简化：直接返回最高分匹配，不再设置阈值
+            matches[image_file] = best_match
+            print(f"Matched {Path(image_file).name} with {Path(best_match).name if best_match else 'None'} (score: {best_score:.3f})")
         
         return matches
 
@@ -538,21 +505,21 @@ def load_mask(mask_path: str) -> np.ndarray:
     - 整数类型的蒙版数组
     """
     if mask_path.endswith(('.npy', '.npz')):
-        mask = np.load(mask_path)
+        mask = np.load(mask_path,allow_pickle=True)
     else:
         # 使用skimage读取图像
         mask = io.imread(mask_path)
         
-        # 如果是RGB图像，转换为灰度
-        if len(mask.shape) == 3:
-            mask = np.mean(mask, axis=2).astype(mask.dtype)
         
         # 检查是否为整数类型
         if mask.dtype.kind not in ['u', 'i']:  # 不是无符号整数或有符号整数
+            print(mask)
             raise ValueError(f"Mask file {mask_path} is not integer type. Got dtype: {mask.dtype}")
     
     # 确保是整数类型
+    
     if mask.dtype.kind not in ['u', 'i']:  # 不是无符号整数或有符号整数
+        print(mask,sep='\n\n\n')
         raise ValueError(f"Mask file {mask_path} is not integer type. Got dtype: {mask.dtype}")
     
     return mask
@@ -563,12 +530,12 @@ class FluorescenceAnalyzer:
     def __init__(self):
         self.analyses: List[TimeSeriesAnalysis] = []
     
-    def load_nd2_file(self, file_path: str, mask_path: Optional[str] = None, skip_initial_frames: int = 0) -> TimeSeriesAnalysis:
+    def load_image_file(self, file_path: str, mask_path: Optional[str] = None, skip_initial_frames: int = 0) -> TimeSeriesAnalysis:
         """
-        加载ND2文件并分析
+        加载图像文件并分析（支持ND2和TIF格式）
         
         Parameters:
-        - file_path: ND2文件路径
+        - file_path: 图像文件路径（支持ND2、TIF等格式）
         - mask_path: 蒙版文件路径
         - skip_initial_frames: 跳过的初始帧数
         """
@@ -588,20 +555,35 @@ class FluorescenceAnalyzer:
             print(f"Error reading mask {mask_path}: {e}")
             return None
         
-        # 使用nd2.imread读取整个文件到numpy数组
-        with nd2.ND2File(file_path) as nd2_file:
-            img_array = nd2_file.asarray()  # 读取整个图像数组
+        # 读取图像数据
+        try:
+            img_array = ImageReader.read_image(file_path)
+        except Exception as e:
+            print(f"Error reading image {file_path}: {e}")
+            return None
         
         # 获取图像信息
         shape = img_array.shape
         if len(shape) == 4:
             time_points, channels, height, width = shape
         elif len(shape) == 3:
-            if 'c' in nd2_file.sizes and nd2_file.sizes['C'] > 1:
+            # 判断是否为多通道单时间点或单通道多时间点
+            if channels := shape[0] if 'c' in ['c'] else None:  # 假设第一个维度是通道数
+                if channels > 1:
+                    channels, height, width = shape
+                    time_points = 1
+                else:
+                    # 假设是时间维度
+                    time_points, channels, height, width = shape[0], 1, shape[1], shape[2]
+            else:
+                # 默认处理方式
                 channels, height, width = shape
                 time_points = 1
-            else:
-                time_points, channels, height, width = 1, 1, shape[0], shape[1]
+        elif len(shape) == 2:
+            # 单通道单时间点
+            height, width = shape
+            channels = 1
+            time_points = 1
         else:
             raise ValueError(f"Unexpected image shape: {shape}")
         
@@ -629,15 +611,16 @@ class FluorescenceAnalyzer:
         
         # 处理每个时间点
         for t in range(time_points):
-            print(f"Processing time point {t+1}/{time_points}")
-            
+          
             # 获取当前时间点的图像
             if time_points > 1:
-                current_img = img_array[t]  # shape: (channels, height, width)
+                current_img = img_array[t]  # shape: (channels, height, width) or (height, width) if single channel
             else:
-                current_img = img_array  # 如果只有一个时间点，可能是 (channels, height, width)
-                if len(current_img.shape) == 2:  # 如果确实是2D，添加通道维度
-                    current_img = current_img[np.newaxis, :, :]
+                current_img = img_array  # 如果只有一个时间点，可能是 (channels, height, width) 或 (height, width)
+            
+            # 如果只有一个通道，扩展维度以保持一致性
+            if len(current_img.shape) == 2:
+                current_img = current_img[np.newaxis, :, :]  # 添加通道维度
             
             # 验证通道数
             if current_img.shape[0] < 2:
@@ -673,22 +656,22 @@ class FluorescenceAnalyzer:
         self.analyses.append(analysis)
         return analysis
     
-    def process_files_with_masks(self, nd2_files: List[str], mask_pattern: Optional[str] = None, skip_initial_frames: int = 0) -> List[TimeSeriesAnalysis]:
-        """处理多个ND2文件，自动匹配蒙版"""
-        # 首先匹配所有ND2文件和蒙版
-        matches = FileMatcher.match_nd2_with_masks(nd2_files, mask_pattern)
+    def process_files_with_masks(self, image_files: List[str], mask_pattern: Optional[str] = None, skip_initial_frames: int = 0) -> List[TimeSeriesAnalysis]:
+        """处理多个图像文件，自动匹配蒙版"""
+        # 首先匹配所有图像文件和蒙版
+        matches = FileMatcher.match_image_with_masks(image_files, mask_pattern)
         
         results = []
         
-        for nd2_file in nd2_files:
-            mask_path = matches[nd2_file]
+        for image_file in image_files:
+            mask_path = matches[image_file]
             if mask_path:
-                print(f"Processing {nd2_file} with mask {mask_path}")
-                analysis = self.load_nd2_file(nd2_file, mask_path, skip_initial_frames)
+                print(f"Processing {image_file} with mask {mask_path}")
+                analysis = self.load_image_file(image_file, mask_path, skip_initial_frames)
                 if analysis:
                     results.append(analysis)
             else:
-                print(f"Skipping {nd2_file} - no matching mask found")
+                print(f"Skipping {image_file} - no matching mask found")
         
         return results
     
@@ -731,46 +714,38 @@ class FluorescenceAnalyzer:
         return pd.DataFrame(data)
 
 def main():
-    parser = argparse.ArgumentParser(description='Analyze fluorescence co-localization in ND2 files')
-    parser.add_argument('nd2_pattern', type=str, 
-                       help='Pattern for ND2 files (e.g., "data/*.nd2" or "data/**/*.nd2")')
+    parser = argparse.ArgumentParser(description='Analyze fluorescence co-localization in ND2/TIF files')
+    parser.add_argument('image_pattern', type=str, 
+                       help='Pattern for image files (e.g., "data/*.nd2", "data/*.tif", or "data/**/*.nd2")')
     parser.add_argument('--mask-pattern', type=str, default=None,
                        help='Pattern for mask files (e.g., "*.npy", "*_mask.npy"). If not provided, will try to auto-match based on filename similarity.')
-    parser.add_argument('--output-dir', type=str, default=None,
-                       help='Output directory for results. If not specified, creates a directory based on input pattern.')
+    parser.add_argument('--output-dir', type=str, default='coloc_result',
+                       help='Output directory for results. Default is "coloc_result".')
     parser.add_argument('--save-results', action='store_true',
                        help='Save results to CSV file')
     parser.add_argument('--skip-initial-frames', type=int, default=0,
                        help='Number of initial frames to skip (not used for fitting)')
     parser.add_argument('--include-scatter', action='store_true',
                        help='Include scatter plot in cell analysis figures')
+    parser.add_argument('--verbose', action='store_true',
+                       help='Show progress bars with tqdm')
     
     args = parser.parse_args()
     
-    # 使用glob查找所有匹配的ND2文件
-    nd2_files = glob.glob(args.nd2_pattern)
-    nd2_files = natsorted(nd2_files)  # 自然排序，确保文件顺序正确
+    # 使用glob查找所有匹配的图像文件
+    image_files = glob.glob(args.image_pattern)
+    image_files = natsorted(image_files)  # 自然排序，确保文件顺序正确
     
-    if not nd2_files:
-        print(f"No ND2 files found matching pattern: {args.nd2_pattern}")
+    if not image_files:
+        print(f"No image files found matching pattern: {args.image_pattern}")
         return
     
-    print(f"Found {len(nd2_files)} ND2 files:")
-    for f in nd2_files:
+    print(f"Found {len(image_files)} image files:")
+    for f in image_files:
         print(f"  {Path(f).name}")  # 只显示文件名，不显示完整路径
     
     # 设置输出目录
-    if args.output_dir is None:
-        # 基于输入模式创建输出目录名
-        input_pattern_path = Path(args.nd2_pattern)
-        if '*' in args.nd2_pattern:
-            base_name = input_pattern_path.parent.name or "analysis"
-        else:
-            base_name = input_pattern_path.stem
-        output_dir = f"output_{base_name}"
-    else:
-        output_dir = args.output_dir
-    
+    output_dir = args.output_dir
     # 自动创建输出目录
     os.makedirs(output_dir, exist_ok=True)
     print(f"Output directory: {output_dir}")
@@ -779,7 +754,7 @@ def main():
     analyzer = FluorescenceAnalyzer()
     
     # 处理文件
-    analyses = analyzer.process_files_with_masks(nd2_files, args.mask_pattern, args.skip_initial_frames)
+    analyses = analyzer.process_files_with_masks(image_files, args.mask_pattern, args.skip_initial_frames)
     
     if not analyses:
         print("No files were successfully processed (no matching masks found)")
@@ -824,15 +799,40 @@ def main():
         # 为每个文件中每个细胞绘制完整的分析图（包含拟合和50%、90%时间点）
         for i, analysis in enumerate(analyses):
             print(f"Processing file {i+1}: {Path(analysis.file_path).name}")
-            for cell_id in analysis.cells.keys():
-                print(f"  Plotting analysis for cell {cell_id}")
+            
+            # 从文件路径获取原始文件名
+            original_filename = Path(analysis.file_path).stem
+            
+            # 创建子文件夹用于存放该文件的细胞图
+            file_output_dir = os.path.join(output_dir, original_filename)
+            os.makedirs(file_output_dir, exist_ok=True)
+            
+            # 获取当前文件中的所有细胞ID
+            all_cell_ids = list(analysis.cells.keys())
+            
+            # 为每个细胞单独保存分析图
+            if args.verbose:
+                cell_iter = tqdm(analysis.cells.keys(), desc=f"Plotting cells for {original_filename}", unit="cell")
+            else:
+                cell_iter = analysis.cells.keys()
+                print(f"  Plotting {len(analysis.cells.keys())} cells for {original_filename}")
+            
+            for cell_id in cell_iter:
+                if not args.verbose:
+                    print(f"    Plotting detailed analysis for cell {cell_id}")
+                
                 fig, axes = analysis.plot_cell_with_fitting(cell_id, include_scatter=args.include_scatter)
                 
-                # 保存图片
-                fig.savefig(os.path.join(output_dir, f'file_{i+1}_cell_{cell_id}_analysis.png'), 
-                            dpi=300, bbox_inches='tight')
-        
-        plt.show()
+                # 保存图片，使用原始文件名作为前缀
+                fig_filename = f"{original_filename}_cell_{cell_id}_analysis.png"
+                fig_path = os.path.join(file_output_dir, fig_filename)
+                fig.savefig(fig_path, dpi=300, bbox_inches='tight')
+                plt.close(fig)  # 关闭图形以释放内存
+                
+                if args.verbose:
+                    pass  # tqdm会自动显示进度
+                else:
+                    print(f"    Saved detailed plot for cell {cell_id} in {original_filename} to {fig_path}")
 
 if __name__ == "__main__":
     main()

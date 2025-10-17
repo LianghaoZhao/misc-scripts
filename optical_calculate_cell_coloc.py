@@ -13,7 +13,6 @@ import argparse
 import glob
 from natsort import natsorted
 import re
-from tqdm import tqdm
 
 def first_order_reaction(t, A0, k, A_inf=0):
     """
@@ -367,7 +366,7 @@ class TimeSeriesAnalysis:
             ax5 = axes[2, 0]
             # 获取该细胞的第一个时间点的数据（或任意时间点）
             first_time_data = next((cd for cd in self.all_cells if cd.cell_id == cell_id and cd.time_point >= self.skip_initial_frames), None)
-            if first_time_data:
+            if first_time_
                 # 移除NaN值进行绘图
                 mask = ~(np.isnan(first_time_data.intensity1) | np.isnan(first_time_data.intensity2))
                 ch1_clean = first_time_data.intensity1[mask]
@@ -484,6 +483,8 @@ class FileMatcher:
                 mask_stem = mask_path.stem
                 
                 score = FileMatcher.calculate_filename_similarity(image_stem, mask_stem)
+                print(f'Score for {image_stem} and {mask_stem} is {score}')
+
                 if score > best_score:
                     best_score = score
                     best_match = mask_file
@@ -611,7 +612,8 @@ class FluorescenceAnalyzer:
         
         # 处理每个时间点
         for t in range(time_points):
-          
+            print(f"Processing time point {t+1}/{time_points}")
+            
             # 获取当前时间点的图像
             if time_points > 1:
                 current_img = img_array[t]  # shape: (channels, height, width) or (height, width) if single channel
@@ -727,8 +729,6 @@ def main():
                        help='Number of initial frames to skip (not used for fitting)')
     parser.add_argument('--include-scatter', action='store_true',
                        help='Include scatter plot in cell analysis figures')
-    parser.add_argument('--verbose', action='store_true',
-                       help='Show progress bars with tqdm')
     
     args = parser.parse_args()
     
@@ -803,36 +803,88 @@ def main():
             # 从文件路径获取原始文件名
             original_filename = Path(analysis.file_path).stem
             
-            # 创建子文件夹用于存放该文件的细胞图
-            file_output_dir = os.path.join(output_dir, original_filename)
-            os.makedirs(file_output_dir, exist_ok=True)
-            
             # 获取当前文件中的所有细胞ID
             all_cell_ids = list(analysis.cells.keys())
             
-            # 为每个细胞单独保存分析图
-            if args.verbose:
-                cell_iter = tqdm(analysis.cells.keys(), desc=f"Plotting cells for {original_filename}", unit="cell")
-            else:
-                cell_iter = analysis.cells.keys()
-                print(f"  Plotting {len(analysis.cells.keys())} cells for {original_filename}")
-            
-            for cell_id in cell_iter:
-                if not args.verbose:
-                    print(f"    Plotting detailed analysis for cell {cell_id}")
+            # 创建一个大图，包含该文件中所有细胞的分析
+            n_cells = len(all_cell_ids)
+            if n_cells == 0:
+                continue
                 
+            # 计算子图布局 (2列)
+            n_cols = 2
+            n_rows = (n_cells + n_cols - 1) // n_cols
+            
+            fig, axes = plt.subplots(n_rows, n_cols, figsize=(12, 6*n_rows))
+            if n_rows == 1:
+                axes = [axes] if n_cols == 1 else axes
+            else:
+                axes = axes.flatten() if n_rows * n_cols > 1 else [axes]
+            
+            # 为每个细胞绘制分析图
+            for idx, cell_id in enumerate(all_cell_ids):
+                print(f"  Plotting analysis for cell {cell_id}")
+                
+                # 获取单个细胞的分析图
+                cell_fig, _ = analysis.plot_cell_with_fitting(cell_id, include_scatter=args.include_scatter, figsize=(12, 10))
+                
+                # 将单个细胞的图复制到大图中
+                ax = axes[idx]
+                # 获取cell_fig中的子图并复制到ax中
+                # 由于直接复制子图比较复杂，我们重新绘制
+                time_points, correlations, p_values = analysis.get_correlation_over_time(cell_id)
+                fit_results = analysis.fit_cell_reaction(cell_id)
+                
+                ax.plot(time_points, correlations, 'o-', label='Correlation', linewidth=2, markersize=6)
+                
+                # 绘制拟合曲线
+                if not np.isnan(fit_results['correlation_k']) and fit_results['correlation_k'] > 0:
+                    t_fit = np.linspace(time_points.min(), time_points.max(), 100)
+                    y_fit = first_order_reaction(t_fit, fit_results['correlation_A0'], 
+                                                fit_results['correlation_k'], fit_results['correlation_A_inf'])
+                    ax.plot(t_fit, y_fit, '--', label='Fitted curve', color='red', linewidth=2)
+                    
+                    # 标记50%和90%反应时间
+                    if not np.isnan(fit_results['correlation_t50']):
+                        ax.axvline(x=fit_results['correlation_t50'], color='orange', linestyle=':', 
+                                   label=f't50: {fit_results["correlation_t50"]:.2f}', linewidth=2)
+                    if not np.isnan(fit_results['correlation_t90']):
+                        ax.axvline(x=fit_results['correlation_t90'], color='purple', linestyle=':', 
+                                   label=f't90: {fit_results["correlation_t90"]:.2f}', linewidth=2)
+                
+                ax.set_xlabel('Time Point')
+                ax.set_ylabel('Pearson Correlation')
+                ax.set_title(f'Cell {cell_id} - Correlation Over Time\nR²: {fit_results["correlation_r_squared"]:.3f}')
+                ax.grid(True, alpha=0.3)
+                ax.legend()
+                ax.axhline(y=0, color='r', linestyle='--', alpha=0.5)
+            
+            # 隐藏多余的子图
+            for idx in range(len(all_cell_ids), len(axes)):
+                axes[idx].set_visible(False)
+            
+            plt.tight_layout()
+            
+            # 保存图片，使用原始文件名作为前缀
+            fig_filename = f"{original_filename}_all_cells_analysis.png"
+            fig_path = os.path.join(output_dir, fig_filename)
+            fig.savefig(fig_path, dpi=300, bbox_inches='tight')
+            plt.close(fig)  # 关闭图形以释放内存
+            print(f"Saved plot for {original_filename} to {fig_path}")
+        
+        # 为每个细胞单独保存分析图
+        for i, analysis in enumerate(analyses):
+            original_filename = Path(analysis.file_path).stem
+            for cell_id in analysis.cells.keys():
+                print(f"  Plotting detailed analysis for cell {cell_id} in {original_filename}")
                 fig, axes = analysis.plot_cell_with_fitting(cell_id, include_scatter=args.include_scatter)
                 
                 # 保存图片，使用原始文件名作为前缀
                 fig_filename = f"{original_filename}_cell_{cell_id}_analysis.png"
-                fig_path = os.path.join(file_output_dir, fig_filename)
+                fig_path = os.path.join(output_dir, fig_filename)
                 fig.savefig(fig_path, dpi=300, bbox_inches='tight')
                 plt.close(fig)  # 关闭图形以释放内存
-                
-                if args.verbose:
-                    pass  # tqdm会自动显示进度
-                else:
-                    print(f"    Saved detailed plot for cell {cell_id} in {original_filename} to {fig_path}")
+                print(f"Saved detailed plot for cell {cell_id} in {original_filename} to {fig_path}")
 
 if __name__ == "__main__":
     main()
